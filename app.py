@@ -305,22 +305,30 @@ def main():
             result = process_spatial_query(interpretation)
 
             if result is not None and not result.empty:
+                # Session state
+                if (
+                    "map" not in st.session_state
+                    or st.session_state["last_result"] is not result
+                ):
+                    map = folium.Map(location=[0, 0], zoom_start=2)
 
-                map = folium.Map(location=[0, 0], zoom_start=2)
+                    folium.GeoJson(
+                        result.__geo_interface__,
+                        style_function=lambda x: {
+                            "fillColor": "blue",
+                            "color": "blue",
+                            "fillOpacity": 0.3,
+                        },
+                    ).add_to(map)
 
-                folium.GeoJson(
-                    result.__geo_interface__,
-                    style_function=lambda x: {
-                        "fillColor": "blue",
-                        "color": "blue",
-                        "fillOpacity": 0.3,
-                    },
-                ).add_to(map)
+                    bounds = result.total_bounds
+                    map.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 
-                bounds = result.total_bounds
-                map.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+                    # Save map and result in session state
+                    st.session_state["map"] = map
+                    st.session_state["last_result"] = result
 
-                st_folium(map)
+                st_folium(st.session_state["map"])
             else:
                 st.warning("No results found for your query.")
 
