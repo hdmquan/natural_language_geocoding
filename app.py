@@ -412,9 +412,22 @@ def main():
                     center_lat = (bounds[1] + bounds[3]) / 2
                     center_lon = (bounds[0] + bounds[2]) / 2
 
+                    # TODO: Better way to do this
+                    # Calculate zoom level based on bounds
+                    zoom_level = 11  # Default zoom level
+                    if bounds[2] - bounds[0] > 0 and bounds[3] - bounds[1] > 0:
+                        zoom_level = min(
+                            20, max(1, 20 - (bounds[2] - bounds[0]) * 7)
+                        )  # Adjust zoom based on width
+
+                    logger.debug(zoom_level)
+
                     # Create view state
                     view_state = pdk.ViewState(
-                        latitude=center_lat, longitude=center_lon, zoom=11, pitch=0
+                        latitude=center_lat,
+                        longitude=center_lon,
+                        zoom=zoom_level,
+                        pitch=0,
                     )
 
                     # Create deck
