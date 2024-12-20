@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import json
 import pydeck as pdk
@@ -381,9 +382,11 @@ def main():
         st.session_state.messages = []
 
     # Get Mapbox token
-    mapbox_token = st.secrets["mapbox"][
-        "token"
-    ]  # Store your token in streamlit secrets
+    # mapbox_token = st.secrets["mapbox"][
+    #     "token"
+    # ]
+
+    mapbox_token = os.environ.get("MAPBOX_TOKEN")
 
     query = st.text_input("Enter your spatial query:", key="query_input")
 
