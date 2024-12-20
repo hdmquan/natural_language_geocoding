@@ -1,15 +1,15 @@
 import streamlit as st
 import json
+import pydeck as pdk
 from openai import OpenAI
 import osmnx as ox
 import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon, LineString
 from shapely.ops import unary_union
-import folium
-from streamlit_folium import st_folium
 from typing import Dict, List, Optional
 import pandas as pd
 from loguru import logger
+from shapely import wkt
 
 client = OpenAI()
 
@@ -86,54 +86,117 @@ OSM_FEATURES = {
 
 
 SYSTEM_PROMPT = """
-You are a geospatial query interpreter. Convert natural language queries into a JSON structure that handles OpenStreetMap features and spatial operations. Use this structure:
+You are a geospatial query interpreter specialized in converting natural language location queries into structured JSON for OpenStreetMap operations. Your goal is to maintain spatial context and relationships between locations while interpreting queries.
+
+Output Schema:
 {
-    "operation": string,  
-    "locations": {       
-        "primary": string[],  
-        "exclude": string[]   
+    "operation": string,  # Required: operation type
+    "locations": {
+        "primary": string[],  # Required: main location(s)
+        "exclude": string[],  # Optional: locations to exclude
+        "context": string[]   # Optional: parent locations for context
     },
-    "features": {        
-        "primary": string,    
-        "specific": string,   
-        "additional": []      
+    "features": {
+        "primary": string,    # Required if features mentioned
+        "specific": string,   # Required if specific feature type
+        "additional": []      # Optional: related features
     },
     "modifiers": {
-        "spatial": [],    
-        "distance": {     
+        "spatial": [],        # Optional: spatial relationships
+        "distance": {
             "value": number,
             "unit": string
         },
-        "filters": {}     
+        "filters": {
+            "tags": {},       # Optional: OSM tags
+            "properties": {}   # Optional: feature properties
+        }
     }
 }
 
-Example queries and responses:
-1. "Give me Victoria and NSW"
+Operations:
+- "get_area": Single area retrieval
+- "union_areas": Combine multiple areas
+- "subtract_areas": Remove areas/features
+- "intersection": Find common areas
+- "buffer": Create area around point/line
+- "filter": Apply feature filters
+
+Spatial Context Rules:
+1. Always include full location paths (e.g., "Melbourne, Victoria, Australia")
+2. Maintain parent-child relationships in location hierarchy
+3. Use "context" field for implicit spatial relationships
+4. Preserve administrative boundaries when mentioned
+
+Example Queries and Responses:
+
+1. "Find schools in Melbourne's CBD"
 {
-    "operation": "union_areas",
+    "operation": "filter",
     "locations": {
-        "primary": ["Victoria, Australia", "New South Wales, Australia"],
-        "exclude": []
+        "primary": ["Melbourne CBD, Melbourne, Victoria, Australia"],
+        "context": ["Melbourne, Victoria, Australia"]
+    },
+    "features": {
+        "primary": "amenity",
+        "specific": "school",
+        "additional": ["education"]
     }
 }
 
-2. "Show me Florida without airports"
+2. "Show me parks within 5km of Sydney Harbor"
+{
+    "operation": "buffer",
+    "locations": {
+        "primary": ["Sydney Harbor, Sydney, New South Wales, Australia"],
+        "context": ["Sydney, New South Wales, Australia"]
+    },
+    "features": {
+        "primary": "leisure",
+        "specific": "park"
+    },
+    "modifiers": {
+        "spatial": ["within"],
+        "distance": {
+            "value": 5,
+            "unit": "km"
+        }
+    }
+}
+
+3. "Give me Victoria and NSW excluding national parks"
 {
     "operation": "subtract_areas",
     "locations": {
-        "primary": ["Florida, USA"],
-        "exclude": []
+        "primary": ["Victoria, Australia", "New South Wales, Australia"],
+        "exclude": [],
+        "context": ["Australia"]
     },
     "features": {
-        "primary": "amenities",
-        "specific": "aeroway",
-        "additional": []
+        "primary": "boundary",
+        "specific": "national_park",
+        "additional": ["protected_area"]
     }
 }
 
-If you cannot interpret the query, respond with:
-{"error": "Cannot interpret query. Please rephrase."}
+Error Handling:
+1. If query is ambiguous, request clarification:
+{
+    "error": "Ambiguous location. Did you mean Melbourne, Australia or Melbourne, Florida?",
+    "suggestions": ["Melbourne, Victoria, Australia", "Melbourne, Florida, USA"]
+}
+
+2. If query cannot be interpreted:
+{
+    "error": "Cannot interpret query. Please rephrase with clearer location or feature details."
+}
+
+Remember to:
+- Always include administrative context for locations
+- Preserve spatial relationships between mentioned places
+- Use appropriate OSM tags for features
+- Include relevant parent locations in context field
+- Handle ambiguous cases with clarification requests
 """
 
 
@@ -173,7 +236,7 @@ def get_features_to_exclude(location: str, features: Dict) -> gpd.GeoDataFrame:
 
 def process_spatial_query(query_json: dict) -> gpd.GeoDataFrame:
     """Process the spatial query based on LLM interpretation"""
-    logger.debug("check")
+    # logger.debug("check")
     try:
         if query_json.get("error"):
             return None
@@ -286,52 +349,88 @@ def apply_spatial_modifiers(gdf: gpd.GeoDataFrame, modifiers: Dict) -> gpd.GeoDa
 def main():
     st.title("Natural Language Geocoding")
 
+    # Initialize session state for messages
     if "messages" not in st.session_state:
         st.session_state.messages = []
+
+    # Get Mapbox token
+    mapbox_token = st.secrets["mapbox"][
+        "token"
+    ]  # Store your token in streamlit secrets
 
     query = st.text_input("Enter your spatial query:", key="query_input")
 
     if query:
-
         interpretation = get_llm_interpretation(query)
 
         if interpretation.get("error"):
             st.error(interpretation["error"])
         else:
-
             with st.expander("Query Interpretation"):
                 st.json(interpretation)
 
             result = process_spatial_query(interpretation)
 
             if result is not None and not result.empty:
-                # Session state
-                if (
-                    "map" not in st.session_state
-                    or st.session_state["last_result"] is not result
-                ):
-                    map = folium.Map(location=[0, 0], zoom_start=2)
+                # Convert GeoDataFrame to format suitable for PyDeck
+                if "geometry" in result.columns:
+                    # Extract coordinates from geometry
+                    geojson_data = result.__geo_interface__
 
-                    folium.GeoJson(
-                        result.__geo_interface__,
-                        style_function=lambda x: {
-                            "fillColor": "blue",
-                            "color": "blue",
-                            "fillOpacity": 0.3,
-                        },
-                    ).add_to(map)
+                    # Create PyDeck layer based on geometry type
+                    if geojson_data["features"][0]["geometry"]["type"] == "Polygon":
+                        layer = pdk.Layer(
+                            "PolygonLayer",
+                            data=geojson_data["features"],
+                            get_polygon="geometry.coordinates",
+                            get_fill_color=[0, 0, 255, 75],  # Blue with 75% opacity
+                            get_line_color=[0, 0, 255],
+                            line_width_min_pixels=1,
+                            pickable=True,
+                            auto_highlight=True,
+                        )
+                    elif geojson_data["features"][0]["geometry"]["type"] == "Point":
+                        layer = pdk.Layer(
+                            "ScatterplotLayer",
+                            data=geojson_data["features"],
+                            get_position="geometry.coordinates",
+                            get_fill_color=[0, 0, 255, 75],
+                            get_radius=1000,
+                            pickable=True,
+                        )
+                    else:
+                        layer = pdk.Layer(
+                            "GeoJsonLayer",
+                            data=geojson_data,
+                            get_fill_color=[0, 0, 255, 75],
+                            get_line_color=[0, 0, 255],
+                            pickable=True,
+                        )
 
+                    # Calculate bounds for viewport
                     bounds = result.total_bounds
-                    map.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+                    center_lat = (bounds[1] + bounds[3]) / 2
+                    center_lon = (bounds[0] + bounds[2]) / 2
 
-                    # Save map and result in session state
-                    st.session_state["map"] = map
-                    st.session_state["last_result"] = result
+                    # Create view state
+                    view_state = pdk.ViewState(
+                        latitude=center_lat, longitude=center_lon, zoom=11, pitch=0
+                    )
 
-                st_folium(st.session_state["map"])
+                    # Create deck
+                    deck = pdk.Deck(
+                        map_style="mapbox://styles/mapbox/light-v9",
+                        initial_view_state=view_state,
+                        layers=[layer],
+                        api_keys={"mapbox": mapbox_token},
+                    )
+
+                    # Display the map
+                    st.pydeck_chart(deck)
             else:
                 st.warning("No results found for your query.")
 
+    # Display chat messages
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
