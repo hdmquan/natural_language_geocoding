@@ -299,7 +299,7 @@ def get_llm_interpretation(query: str) -> dict:
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": query},
+                {"role": "user", "content": "Give me " + query},
             ],
         )
         return json.loads(response.choices[0].message.content)
