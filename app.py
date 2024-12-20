@@ -1,4 +1,3 @@
-# app.py
 import streamlit as st
 import json
 from openai import OpenAI
@@ -10,9 +9,11 @@ import folium
 from streamlit_folium import st_folium
 from typing import Dict, List, Optional
 import pandas as pd
+from loguru import logger
 
-# TODO: No hard code
-# OSM feature categories
+client = OpenAI()
+
+
 OSM_FEATURES = {
     "amenities": [
         "hospital",
@@ -83,50 +84,143 @@ OSM_FEATURES = {
     "waterways": ["river", "stream", "canal", "drain", "ditch"],
 }
 
-# TODO: Improve. This is like the worst prompt I've ever seen :((
+
 SYSTEM_PROMPT = """
-You are a geospatial query interpreter. Convert natural language queries into a JSON structure that handles all OpenStreetMap primary features. Use this structure:
+You are a geospatial query interpreter. Convert natural language queries into a JSON structure that handles OpenStreetMap features and spatial operations. Use this structure:
 {
-    "operation": string,  # get_features, get_area, get_distance, get_poi
-    "location": string,   # primary location to search
-    "features": {        # OSM features to search for
-        "primary": string,    # main category (amenities, boundaries, buildings, etc.)
-        "specific": string,   # specific feature type
-        "additional": []      # additional features to consider
+    "operation": string,  
+    "locations": {       
+        "primary": string[],  
+        "exclude": string[]   
+    },
+    "features": {        
+        "primary": string,    
+        "specific": string,   
+        "additional": []      
     },
     "modifiers": {
-        "spatial": [],    # spatial modifications (within, without, left_of, etc.)
-        "distance": {     # distance specifications
+        "spatial": [],    
+        "distance": {     
             "value": number,
             "unit": string
         },
-        "filters": {}     # additional filters
+        "filters": {}     
     }
 }
 
-Available feature categories:
-- amenities (hospital, school, restaurant, etc.)
-- boundaries (administrative, national_park, etc.)
-- buildings (residential, commercial, etc.)
-- barriers (wall, fence, gate, etc.)
-- highways (motorway, primary, residential, etc.)
-- landuse (residential, commercial, forest, etc.)
-- natural (water, wood, beach, etc.)
-- waterways (river, stream, canal, etc.)
+Example queries and responses:
+1. "Give me Victoria and NSW"
+{
+    "operation": "union_areas",
+    "locations": {
+        "primary": ["Victoria, Australia", "New South Wales, Australia"],
+        "exclude": []
+    }
+}
+
+2. "Show me Florida without airports"
+{
+    "operation": "subtract_areas",
+    "locations": {
+        "primary": ["Florida, USA"],
+        "exclude": []
+    },
+    "features": {
+        "primary": "amenities",
+        "specific": "aeroway",
+        "additional": []
+    }
+}
 
 If you cannot interpret the query, respond with:
 {"error": "Cannot interpret query. Please rephrase."}
 """
 
-client = OpenAI()
+
+# TODO: Limit the search area
+def get_combined_area(locations: List[str]) -> gpd.GeoDataFrame:
+    """Get and combine multiple areas"""
+    combined_gdf = None
+
+    if locations is None:
+        logger.warning("No locations found.")
+        return None
+
+    for location in locations:
+        try:
+            gdf = ox.geocode_to_gdf(location)
+            if combined_gdf is None:
+                combined_gdf = gdf
+            else:
+                combined_gdf.geometry = combined_gdf.geometry.union(
+                    gdf.geometry.iloc[0]
+                )
+        except Exception as e:
+            st.warning(f"Error processing location {location}: {str(e)}")
+
+    return combined_gdf
+
+
+def get_features_to_exclude(location: str, features: Dict) -> gpd.GeoDataFrame:
+    """Get features that should be excluded from the area"""
+    tags = build_osm_tags(features)
+    try:
+        return ox.features_from_place(location, tags=tags)
+    except Exception as e:
+        st.warning(f"Error getting features to exclude: {str(e)}")
+        return None
+
+
+def process_spatial_query(query_json: dict) -> gpd.GeoDataFrame:
+    """Process the spatial query based on LLM interpretation"""
+    logger.debug("check")
+    try:
+        if query_json.get("error"):
+            return None
+
+        if query_json["operation"] == "union_areas":
+            return get_combined_area(query_json["locations"]["primary"])
+
+        elif query_json["operation"] == "subtract_areas":
+
+            base_area = get_combined_area(query_json["locations"]["primary"])
+
+            if base_area is None:
+                return None
+
+            exclude_area = get_combined_area(query_json["locations"]["exclude"])
+            base_area.geometry = base_area.geometry.difference(exclude_area)
+
+            return base_area
+
+        else:
+
+            location = query_json["locations"]["primary"][0]
+
+            tags = build_osm_tags(query_json.get("features", {}))
+
+            if query_json["operation"] == "get_features":
+                result = ox.features_from_place(location, tags=tags)
+            elif query_json["operation"] == "get_area":
+                result = ox.geocode_to_gdf(location)
+            elif query_json["operation"] == "get_distance":
+                result = ox.geocode_to_gdf(location)
+            else:
+                return None
+
+            result = apply_spatial_modifiers(result, query_json.get("modifiers", {}))
+            return result
+
+    except Exception as e:
+        st.error(f"Error processing spatial query: {str(e)}")
+        return None
 
 
 def get_llm_interpretation(query: str) -> dict:
     """Get LLM interpretation of the natural language query"""
     try:
         response = client.chat.completions.create(
-            # For some reason only gpt-4 works, 4o and 4o-mini doesn't
-            model="gpt-4",
+            model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": query},
@@ -145,14 +239,12 @@ def build_osm_tags(features: Dict) -> Dict:
         primary = features["primary"].lower()
         specific = features["specific"].lower()
 
-        # Handle different feature types
         if primary in OSM_FEATURES:
             if specific in OSM_FEATURES[primary]:
                 tags[primary] = specific
             else:
                 tags[primary] = True
 
-    # Add additional features
     for feature in features.get("additional", []):
         if isinstance(feature, dict):
             tags.update(feature)
@@ -162,12 +254,13 @@ def build_osm_tags(features: Dict) -> Dict:
 
 def apply_spatial_modifiers(gdf: gpd.GeoDataFrame, modifiers: Dict) -> gpd.GeoDataFrame:
     """Apply spatial modifications to the GeoDataFrame"""
+    logger.debug(modifiers)
+
     if not modifiers:
         return gdf
 
     result = gdf.copy()
 
-    # Handle distance modifications
     if "distance" in modifiers and modifiers["distance"].get("value"):
         distance = modifiers["distance"]["value"]
         unit = modifiers["distance"].get("unit", "meters")
@@ -179,10 +272,9 @@ def apply_spatial_modifiers(gdf: gpd.GeoDataFrame, modifiers: Dict) -> gpd.GeoDa
 
         result.geometry = result.geometry.buffer(distance)
 
-    # Handle spatial relations
     for spatial_mod in modifiers.get("spatial", []):
         if spatial_mod == "without":
-            # Implement exclusion
+
             if "exclude_geometry" in modifiers:
                 result.geometry = result.geometry.difference(
                     modifiers["exclude_geometry"]
@@ -191,74 +283,31 @@ def apply_spatial_modifiers(gdf: gpd.GeoDataFrame, modifiers: Dict) -> gpd.GeoDa
     return result
 
 
-def process_spatial_query(query_json: dict) -> gpd.GeoDataFrame:
-    """Process the spatial query based on LLM interpretation"""
-    try:
-        if query_json.get("error"):
-            return None
-
-        # Get base location
-        location = query_json["location"]
-
-        # Build OSM tags
-        tags = build_osm_tags(query_json.get("features", {}))
-
-        # Get features based on operation type
-        if query_json["operation"] == "get_features":
-            # Get specific features within the area
-            result = ox.features_from_place(location, tags=tags)
-
-        elif query_json["operation"] == "get_area":
-            # Get base area
-            result = ox.geocode_to_gdf(location)
-
-        elif query_json["operation"] == "get_distance":
-            # Handle distance-based queries
-            result = ox.geocode_to_gdf(location)
-
-        else:
-            return None
-
-        # Apply any spatial modifiers
-        result = apply_spatial_modifiers(result, query_json.get("modifiers", {}))
-
-        return result
-
-    except Exception as e:
-        st.error(f"Error processing spatial query: {str(e)}")
-        return None
-
-
 def main():
     st.title("Natural Language Geocoding")
 
-    # Initialize chat history
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Chat input
     query = st.text_input("Enter your spatial query:", key="query_input")
 
     if query:
 
-        # Get LLM interpretation
         interpretation = get_llm_interpretation(query)
 
         if interpretation.get("error"):
             st.error(interpretation["error"])
         else:
-            # Show interpretation (for debugging)
+
             with st.expander("Query Interpretation"):
                 st.json(interpretation)
 
-            # Process spatial query
             result = process_spatial_query(interpretation)
 
             if result is not None and not result.empty:
-                # Display map
-                m = folium.Map(location=[0, 0], zoom_start=2)
 
-                # Convert to GeoJSON and add to map
+                map = folium.Map(location=[0, 0], zoom_start=2)
+
                 folium.GeoJson(
                     result.__geo_interface__,
                     style_function=lambda x: {
@@ -266,18 +315,15 @@ def main():
                         "color": "blue",
                         "fillOpacity": 0.3,
                     },
-                ).add_to(m)
+                ).add_to(map)
 
-                # Fit map bounds to the data
                 bounds = result.total_bounds
-                m.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
+                map.fit_bounds([[bounds[1], bounds[0]], [bounds[3], bounds[2]]])
 
-                # Display map
-                st_folium(m)
+                st_folium(map)
             else:
                 st.warning("No results found for your query.")
 
-    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
