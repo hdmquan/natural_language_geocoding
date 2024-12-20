@@ -302,6 +302,20 @@ def get_llm_interpretation(query: str) -> dict:
                 {"role": "user", "content": "Give me " + query},
             ],
         )
+        logger.debug(response.choices[0].message.content)
+        if "error" in response.choices[0].message.content:
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": "Give me " + query},
+                    {
+                        "role": "user",
+                        "content": "Yes, it is. Please proceed with your broadest assumptions or most potential locations.",
+                    },
+                ],
+            )
+        logger.debug(response.choices[0].message.content)
         return json.loads(response.choices[0].message.content)
     except Exception as e:
         return {"error": f"Error interpreting query: {str(e)}"}
@@ -385,11 +399,19 @@ def main():
             result = process_spatial_query(interpretation)
 
             if result is not None and not result.empty:
+
+                geojson_data = result.__geo_interface__
                 # Convert GeoDataFrame to format suitable for PyDeck
                 if "geometry" in result.columns:
                     # Extract coordinates from geometry
                     geojson_data = result.__geo_interface__
 
+                    st.download_button(
+                        label="Download GeoJSON",
+                        data=json.dumps(geojson_data),
+                        file_name="result.geojson",
+                        mime="application/json",
+                    )
                     # Create PyDeck layer based on geometry type
                     if geojson_data["features"][0]["geometry"]["type"] == "Polygon":
                         layer = pdk.Layer(
@@ -426,6 +448,7 @@ def main():
                     center_lon = (bounds[0] + bounds[2]) / 2
 
                     # TODO: Better way to do this
+                    # Default doesn't not work and have too high zoom
                     # Calculate zoom level based on bounds
                     zoom_level = 11  # Default zoom level
                     if bounds[2] - bounds[0] > 0 and bounds[3] - bounds[1] > 0:
