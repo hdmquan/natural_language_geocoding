@@ -323,7 +323,7 @@ def get_llm_interpretation(query: str) -> dict:
 
 
 def build_osm_tags(features: Dict) -> Dict:
-    """Build OSM tags dictionary based on feature specifications"""
+
     tags = {}
 
     if features.get("primary") and features.get("specific"):
@@ -344,7 +344,7 @@ def build_osm_tags(features: Dict) -> Dict:
 
 
 def apply_spatial_modifiers(gdf: gpd.GeoDataFrame, modifiers: Dict) -> gpd.GeoDataFrame:
-    """Apply spatial modifications to the GeoDataFrame"""
+
     logger.debug(modifiers)
 
     if not modifiers:
@@ -377,11 +377,9 @@ def apply_spatial_modifiers(gdf: gpd.GeoDataFrame, modifiers: Dict) -> gpd.GeoDa
 def main():
     st.title("Natural Language Geocoding")
 
-    # Initialize session state for messages
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Get Mapbox token
     # mapbox_token = st.secrets["mapbox"][
     #     "token"
     # ]
@@ -404,7 +402,7 @@ def main():
             if result is not None and not result.empty:
 
                 geojson_data = result.__geo_interface__
-                # Convert GeoDataFrame to format suitable for PyDeck
+                # GeoDataFrame to PyDeck
                 if "geometry" in result.columns:
                     # Extract coordinates from geometry
                     geojson_data = result.__geo_interface__
@@ -415,7 +413,7 @@ def main():
                         file_name="result.geojson",
                         mime="application/json",
                     )
-                    # Create PyDeck layer based on geometry type
+                    # PyDeck layer
                     if geojson_data["features"][0]["geometry"]["type"] == "Polygon":
                         layer = pdk.Layer(
                             "PolygonLayer",
@@ -445,23 +443,23 @@ def main():
                             pickable=True,
                         )
 
-                    # Calculate bounds for viewport
+                    # FIXME
                     bounds = result.total_bounds
                     center_lat = (bounds[1] + bounds[3]) / 2
                     center_lon = (bounds[0] + bounds[2]) / 2
 
-                    # TODO: Better way to do this
+                    # FIXME: Better way to do this
                     # Default doesn't not work and have too high zoom
                     # Calculate zoom level based on bounds
-                    zoom_level = 11  # Default zoom level
+                    # Some times it does not work :(
+                    zoom_level = 11  # Default
                     if bounds[2] - bounds[0] > 0 and bounds[3] - bounds[1] > 0:
                         zoom_level = min(
                             20, max(1, 20 - (bounds[2] - bounds[0]) * 7)
-                        )  # Adjust zoom based on width
+                        )
 
                     # logger.debug(zoom_level)
 
-                    # Create view state
                     view_state = pdk.ViewState(
                         latitude=center_lat,
                         longitude=center_lon,
@@ -469,7 +467,6 @@ def main():
                         pitch=0,
                     )
 
-                    # Create deck
                     deck = pdk.Deck(
                         map_style="mapbox://styles/mapbox/light-v9",
                         initial_view_state=view_state,
@@ -477,12 +474,11 @@ def main():
                         api_keys={"mapbox": mapbox_token},
                     )
 
-                    # Display the map
                     st.pydeck_chart(deck)
             else:
                 st.warning("No results found for your query.")
 
-    # Display chat messages
+    # Debug msg
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.write(message["content"])
